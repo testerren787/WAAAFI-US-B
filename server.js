@@ -435,18 +435,37 @@ class BotManager {
     const fullUrl = `${CONFIG.WEBHOOK_URL}${this._path}`;
 
     try {
-      // Delete old webhook (drop pending)
+      // Call Telegram API directly to set webhook (node-telegram-bot-api doesn't expose setWebhook method)
+      const apiUrl = `https://api.telegram.org/bot${this.user.botToken}`;
+
+      // Delete old webhook first
       try {
-        await this.bot.deleteWebhook?.({ drop_pending_updates: true });
+        const deleteResponse = await fetch(`${apiUrl}/deleteWebhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ drop_pending_updates: true }),
+        });
+        logger.debug(`${this.user.name}: old webhook deleted`);
       } catch (e) {
-        logger.debug(`${this.user.name}: deleteWebhook skipped`);
+        logger.debug(`${this.user.name}: deleteWebhook error (may not exist):`, e.message);
       }
 
-      // Set new webhook
-      await this.bot.setWebhook(fullUrl, {
-        allowed_updates: ['message', 'callback_query'],
-        drop_pending_updates: true,
+      // Set new webhook using Telegram Bot API
+      const setWebhookResponse = await fetch(`${apiUrl}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: fullUrl,
+          allowed_updates: ['message', 'callback_query'],
+          drop_pending_updates: true,
+        }),
       });
+
+      const result = await setWebhookResponse.json();
+
+      if (!result.ok) {
+        throw new Error(`Telegram API error: ${result.description || 'Unknown error'}`);
+      }
 
       logger.info(`${this.user.name}: webhook set → ${fullUrl}`);
 
